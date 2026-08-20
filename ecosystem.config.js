@@ -8,5 +8,9 @@ module.exports = {
       name: "relayer-signer2",
       script: "./start-signer2.sh",
     },
+    {
+      name: "relayer-monitor",
+      script: "./relayer/monitor.js",
+    },
   ],
 };
