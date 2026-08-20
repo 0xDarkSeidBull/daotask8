@@ -38,7 +38,8 @@ Users lock ETH on Sepolia. Three independent relayer processes watch for that lo
 - ⚡ **Fully automatic minting**  no separate "claim" transaction, mint fires the moment consensus is reached
 - 🔍 **100% verifiable**  every lock/mint pair is checkable on Sepolia Etherscan and the Redbelly explorer
 - 📊 **Live bridge history API**  every bridged transaction, queryable by anyone, not just the sender
-- 🧪 **Testnet-proven**  multiple real end-to-end transactions verified on-chain (see below)
+- 🆘 **Stuck-fund recovery built in**  a self-serve support-ticket system with automatic already-bridged detection (see [Stuck-Fund Recovery](#-stuck-fund-recovery-support-tickets))
+- 🧪 **Testnet-proven**  multiple real end-to-end transactions verified on-chain, including a genuinely recovered stuck lock (see below)
 
 ---
 
@@ -90,8 +91,8 @@ dao-redbelly/
 │   └── EndToEndFlow.test.js          # full lock → approve → mint simulation
 ├── relayer/
 │   ├── relayer.js                    # off-chain relayer process (run once per signer)
-│   ├── db.js                         # SQLite persistence layer for bridge history
-│   └── api.js                        # read-only HTTP API exposing bridge history
+│   ├── db.js                         # SQLite persistence layer for bridge history + support tickets
+│   └── api.js                        # HTTP API: bridge history (read-only) + support-ticket endpoints
 ├── ecosystem.config.js               # pm2 process definitions (2 relayer instances)
 ├── start-signer1.sh / start-signer2.sh   # env-loading wrapper scripts
 ├── hardhat.config.js
@@ -103,7 +104,7 @@ dao-redbelly/
 
 - **Contracts:** Solidity, Hardhat, ethers.js v6
 - **Relayer:** Node.js, SQLite (better-sqlite3), PM2-managed
-- **API:** Read-only HTTP API exposing live bridge history
+- **API:** HTTP API exposing live bridge history and the stuck-fund support-ticket system
 - **Networks:** Ethereum Sepolia (source) · Redbelly Testnet, Chain ID `153` (destination)
 
 ---
@@ -255,6 +256,28 @@ Measured on Sepolia and Redbelly Testnet, gas price at time of testing (August 2
 
 ---
 
+## 🆘 Stuck-Fund Recovery: Support Tickets
+
+A lock that never resolves  whether from a relayer-side bug or a user submitting a malformed recipient  previously had no visible recovery path beyond asking directly. Redbridge now exposes a self-serve support-ticket system, backed by the same bridge-history database, so a stuck (or apparently-stuck) transaction always has a next step.
+
+- **Open a ticket.** A user submits their Sepolia lock tx hash and wallet address from the app's Contact Support / Reclaim flow. The ticket automatically attaches the lock's current on-chain status  no manual lookup required.
+- **Already-bridged detection is automatic.** If the submitted transaction has, in fact, already minted successfully, the ticket is created *and closed* in the same request, tagged `resolved_already_bridged`, with the destination Redbelly transaction attached as proof. Most "is my bridge stuck?" questions resolve themselves instantly, with no human in the loop.
+- **Genuinely stuck locks stay `active`** until manually resolved, with the on-chain lock status attached, so no context is lost between the user's report and whoever investigates it.
+- **Duplicate protection.** Re-submitting the same transaction while a ticket is already open returns the existing ticket instead of creating a second one.
+- **My Tickets view.** A wallet can list every ticket it has opened, split into Active and Solved, without needing to remember a ticket ID.
+
+**API**
+```
+POST /api/support-ticket                      open a ticket (auto-resolves if already minted)
+GET  /api/support-ticket/:ticketId             fetch a single ticket
+GET  /api/support-ticket/wallet/:address       all tickets for a wallet, split Active / Solved
+POST /api/support-ticket/:ticketId/resolve     admin-only, marks a stuck lock as recovered
+```
+
+This closes the gap the original design left open: a stuck lock is no longer a silent failure. It's a tracked, resolvable ticket, with its outcome  already bridged, or manually recovered  documented and attached to a Redbelly transaction hash. Nonce `#9` in [Verified Testnet Transactions](#-verified-testnet-transactions) below is a real, end-to-end proof of this: a lock that was genuinely stuck for ~22 hours, recovered once the fix in [Troubleshooting §8](#-troubleshooting) was deployed.
+
+---
+
 ## 🔧 Troubleshooting
 
 Real errors hit during development, with root cause and fix  not hypothetical.
@@ -307,17 +330,36 @@ A new API server shows `online` in `pm2 status` but every request 404s  another 
 **7. Mint confirmation feels slow (~60-90s) on testnet**
 `CONFIRMATION_BLOCKS=5` (waiting for 5 Sepolia block confirmations before relaying) plus a 15-second poll interval add up on testnet, where reorg risk is negligible compared to mainnet. Fix: drop `CONFIRMATION_BLOCKS` to `2` and the relayer's `POLL_INTERVAL_MS` to `5000` for a faster testnet experience  cuts the wait to roughly 25-30 seconds, still with enough confirmation depth to be safe against testnet reorgs. Going to `0` isn't recommended even on testnet: it removes the buffer entirely, so a reorged block could get relayed as if it were final.
 
+**8. A stuck lock gets permanently skipped as "possible reorg"  but it wasn't a reorg**
+`getLogsChunked()` returned a partial (sometimes empty) event array on an RPC error without throwing  the retry loop logged the failure and silently returned whatever had been collected so far. `verifyLockStillValid()` then compared that against the expected lock and, on an empty result, assumed the lock had been reorged out. It had no way to tell an RPC hiccup apart from a chain that genuinely no longer contains the event, so it permanently skipped the lock  the mint would never be attempted again without manual intervention. Fix: have `getLogsChunked()` throw once its retry budget is exhausted, instead of swallowing the error. Wrap the `verifyLockStillValid()` call in a try/catch: a thrown error means "ask again later" (re-queued with a 30-second backoff), and only a clean, successful query that genuinely returns zero matching events counts as a reorg.
+```js
+if (attempt >= 3) {
+  console.error(`getLogs chunk [${start}-${end}] failed after 3 attempts:`, err.message);
+  throw new Error(`getLogsChunked exhausted retries for [${start}-${end}]: ${err.message}`);
+}
+```
+
+**9. Verification window queries blocks that haven't been mined yet**
+`verifyLockStillValid()`'s query window was `originalBlockNumber + CHUNK_SIZE` (10 blocks ahead), but `CONFIRMATION_BLOCKS` was only 2. On a fresh lock, the relayer tried to verify against a block range that didn't exist on chain yet. This fired on *every single lock*, not just under RPC stress, and only resolved once the chain naturally caught up, roughly 90-100 seconds later  which the item 8 retry-queue patched over by design rather than fixing outright. Fix: cap the window's end at the chain's current block height, never past it.
+```js
+const currentHead = await sepoliaProvider.getBlockNumber();
+const windowEnd = Math.min(originalBlockNumber + CHUNK_SIZE, currentHead);
+```
+
 ---
 
 ## ✅ Verified Testnet Transactions
 
-All transactions below are independently verifiable on the respective block explorers.
+All transactions below were bridged in this testing cycle (19–20 August 2026) and are independently verifiable on the respective block explorers. Nonce `#9` was genuinely stuck for roughly 22 hours due to the RPC-lag bug in [Troubleshooting §8](#-troubleshooting), and is included here specifically as proof the fix  and the [recovery path](#-stuck-fund-recovery-support-tickets)  works end to end, not only in isolation.
 
 | Lock nonce | Sepolia lock tx | Redbelly mint tx | Amount | Status |
 |---|---|---|---|---|
-| #6 | [`0x29b92a82...558dd1c`](https://sepolia.etherscan.io/tx/0x29b92a82cae58ff0708ef583b64a8d6fdcf04c77a6d4625ee19184871558dd1c) | [`0xf87eecf5...39bc10`](https://redbelly.testnet.routescan.io/tx/0xf87eecf5413b4baef485821ad4928770037e083de7fad4953766780ffa39bc10) | 0.001 ETH | ✅ Minted, both approvals verified on-chain |
-| #5 | [`0x0faeb82a...6278ca`](https://sepolia.etherscan.io/tx/0x0faeb82a07547cd7949878148ea4ca2f8a72e6db16c3eb923ae020c4196278ca) | [`0xea18ddd1...860f6d`](https://redbelly.testnet.routescan.io/tx/0xea18ddd18abc223e1bf1e107a2faa07742dc2933cbf2230fa3b3ecb252860f6d) | 0.001 ETH | ✅ Minted |
-| #4 | [`0x973ba2f4...cce7c4e6`](https://sepolia.etherscan.io/tx/0x973ba2f49a0d9a8e7868340e8b8698bbe9c042b103f27ddd0e5b86eecce7c4e6) | [`0x68c043fa...41e38d`](https://redbelly.testnet.routescan.io/tx/0x68c043fa02282bd620db6c6b90432ec46f842ebeb0daecd3938ec4bd5d41e38d) | 0.001 ETH | ✅ Minted |
+| #17 | [`0xbef7522a...b91893a`](https://sepolia.etherscan.io/tx/0xbef7522a4d15a9708f83c90034359f02e5ce035b3beae017044352450b91893a) | [`0x815e7c58...f2345c`](https://redbelly.testnet.routescan.io/tx/0x815e7c58484ae15a6116bab2095d88c27a5bd73e261a6317621ffa5951f2345c) | 0.001 ETH | ✅ Minted |
+| #16 | [`0x84b13ca3...d05737`](https://sepolia.etherscan.io/tx/0x84b13ca308679a7ebb902b7c227323248fcfe86473bd92298513520a05d05737) | [`0x91f30864...d7774a`](https://redbelly.testnet.routescan.io/tx/0x91f30864af8227f8b3d2332c68dcc7169260f37b115d43179bd6922633d7774a) | 0.001 ETH | ✅ Minted |
+| #15 | [`0xc3d52399...19b657`](https://sepolia.etherscan.io/tx/0xc3d52399064fb2019ea50b764c0f1ec0ef600c853e6d7876f752fe777819b657) | [`0x1cca9aa1...b44a03`](https://redbelly.testnet.routescan.io/tx/0x1cca9aa129c87fa7cd86443ec578c18da8e45642558d939baef7509621b44a03) | 0.0011 ETH | ✅ Minted |
+| #14 | [`0x48a5267f...5381b7`](https://sepolia.etherscan.io/tx/0x48a5267f86c24f3ecbbfa705fbb36126013e6a17e72d5a9055cfffe79b5381b7) | [`0xebac3c36...082ffc`](https://redbelly.testnet.routescan.io/tx/0xebac3c365f5eb195f5357a4299becf58b766c9a476bec2dbf360e47b4e082ffc) | 0.0012 ETH | ✅ Minted |
+| #13 | [`0x626c2af8...3ba878`](https://sepolia.etherscan.io/tx/0x626c2af8bb77ee5cf8b2f5039283ccd5360dd3d3593c3858515abe80753ba878) | [`0xe9a6e522...a48855`](https://redbelly.testnet.routescan.io/tx/0xe9a6e5221ecf0964fd631e63efebe3bd94c1fb48f0ed5ca711aa7b3b99a48855) | 0.001 ETH | ✅ Minted |
+| #9 | [`0x2b370c4f...a7889e`](https://sepolia.etherscan.io/tx/0x2b370c4fcf229328218cac6f9a95b463bcf1242d742d9c02b770ee9673a7889e) | [`0xe9e8f29f...4891ce`](https://redbelly.testnet.routescan.io/tx/0xe9e8f29f37409e22c36ca4f4b9b3c6c7ee11f5806d49368b518ea340154891ce) | 0.1 ETH | ✅ Minted  recovered from a stuck state ([item 8](#-troubleshooting)) |
 
 **Deployed contracts:**
 - `SepoliaLockVault` (Sepolia): [`0x130d07624d00DF30A5C30C3D237fD5d99A3DdE11`](https://sepolia.etherscan.io/address/0x130d07624d00DF30A5C30C3D237fD5d99A3DdE11)
@@ -342,8 +384,6 @@ Whether major cross-chain protocols currently support Redbelly Network natively 
 | **Connext** | ⚠️ **Unconfirmed**  new chains added on request via Discord, not a static list | [nxtp-docs.connext.network](https://nxtp-docs.connext.network/Integration/SystemOverview/chains/) |
 | **Multichain** | ⛔ **N/A**  discontinued in 2023 |  |
 
-**Beyond the original task list**, two integrations are more directly relevant:
-
 **Beyond the original task list**, four integrations are more directly relevant:
 
 - **Celer's cBridge** added Redbelly Network support in August 2025  bridges tokens between Ethereum, BNB Chain, and Redbelly.
@@ -365,6 +405,7 @@ This repo's bridge demonstrates the minimal architecture needed for a Redbelly i
 - [x] Chunked `eth_getLogs` scanning for free-tier RPC compatibility
 - [x] pm2-managed relayer processes with env-reload fix
 - [x] Existing bridge protocol research (LayerZero, Wormhole, Axelar, Connext, cBridge)
+- [x] Stuck-fund recovery: support-ticket system with automatic already-bridged detection, duplicate protection, and admin resolution
 - [ ] Batched-mint pattern for high-volume production use
 - [ ] ERC-20 token support beyond native ETH
 - [ ] Mainnet deployment, potentially on LayerZero DVN/Executor infrastructure
