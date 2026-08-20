@@ -115,8 +115,8 @@ Prerequisites: Node.js ≥ 18 · Sepolia ETH ([faucet](https://sepoliafaucet.com
 
 ```bash
 # Clone & install
-git clone https://github.com/0xDarkSeidBull/dao-redbelly.git
-cd dao-redbelly
+git clone https://github.com/0xDarkSeidBull/daotask8.git
+cd daotask8
 npm install
 
 # Configure environment
